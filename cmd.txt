@@ -1,0 +1,5 @@
+source /media/user/new_volume/Sakshi/rf_detr/myenv/bin/activate
+
+CHECKPOINT_PATH = r"/media/user/New Volume1/Sakshi/chattishgarh/new_output/rfdetr_medium/checkpoint_best_total.pth"
+INPUT_VIDEO     = r"/media/user/New Volume1/Sakshi/chattishgarh/DJI_20260110101923_0001_D.MP4"
+OUTPUT_VIDEO    = r"out_video.mp4"
