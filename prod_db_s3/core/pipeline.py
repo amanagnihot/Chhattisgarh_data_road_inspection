@@ -285,7 +285,7 @@ class VideoPipeline:
         )
 
         output_fps = max(1.0, reader.fps / settings.process_every_n_frames)
-        video_out_path = file_manager.temp_annotated_video_path(video_basename)
+        video_out_path = file_manager.working_annotated_video_path(video_basename)
         out = cv2.VideoWriter(
             str(video_out_path),
             cv2.VideoWriter_fourcc(*"mp4v"),
@@ -400,8 +400,8 @@ class VideoPipeline:
 
         def _save_track(track, det_id, vbase, fm, sv_saver, dets_list, srt_name):
             dtype = track["type"]
-            crop_path  = fm.temp_crop_path(dtype,  det_id, vbase)
-            frame_path = fm.temp_frame_path(dtype, det_id, vbase)
+            crop_path  = fm.working_crop_path(dtype,  det_id, vbase)
+            frame_path = fm.working_frame_path(dtype, det_id, vbase)
             sv_saver.save(crop_path,  track["best_snapshot"]["crop"])
             sv_saver.save(frame_path, track["best_snapshot"]["full_frame"])
 
