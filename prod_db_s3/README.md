@@ -1,74 +1,108 @@
-# Road Assessment Pipeline — Production System
-
-Drone-video road defect detection powered by **RFDETRSegMedium**, served via a
-**FastAPI** REST API, with outputs stored in **AWS S3** and indexed in **MySQL**.
+# Road Assessment API
+RF-DETR based road defect detection pipeline with FastAPI, MySQL, and AWS S3.
 
 ---
 
-## Architecture
+## System Overview
 
 ```
-Client
-  │
-  │  POST /jobs  { video_s3_url, srt_s3_url }
-  ▼
-FastAPI (main.py)
-  │
-  ├─► Job record created in MySQL  (status = pending)
-  │
-  └─► Background task: job_runner.run_job(job_id)
-            │
-            ├─ 1. DOWNLOAD   S3 → temp/{job_id}/input/
-            ├─ 2. PROCESS    pipeline.py (RF-DETR + tracker)
-            │       → temp/{job_id}/output/
-            ├─ 3. MOVE       temp/output/ → final/{job_id}/
-            ├─ 4. UPLOAD     final/{job_id}/ → S3
-            ├─ 5. DB WRITE   detections table (with S3 URLs)
-            └─ 6. CLEANUP    rm -rf temp/{job_id}/
-
-  GET /jobs/{job_id}  → status + S3 output URLs
-  GET /jobs/{job_id}/detections  → all defects with S3 image links
+Client → POST /jobs  (video S3 URL + SRT S3 URL)
+       → Job queued → processed one at a time
+       → Results uploaded to S3
+       → All links saved to MySQL
+       → Terminal notification on complete/fail
 ```
 
-### Folder Structure (runtime)
+---
+
+## S3 Folder Structure
 
 ```
-temp/
-└── {job_id}/
-    ├── input/
-    │   ├── DJI_0001.MP4
-    │   └── DJI_0001.SRT
-    └── output/
-        ├── annotated_video/
-        ├── defects/
-        │   ├── pothole/
-        │   ├── cracking/
-        │   └── ...
-        └── frames/
-
-final/
-└── {job_id}/
-    ├── output/         ← same structure as temp/output (after move)
-    └── reports/
-        └── DJI_0001_detections.json
+novametrics-ai-data-processing/
+└── Chattisgarh_Road_defect_detection/
+    └── 2026-02-06_DJI_20260206174112_0754_D/     ← date_videoname (parent folder)
+        ├── input/                                  ← original files (uploaded manually)
+        │   ├── DJI_20260206174112_0754_D.MP4
+        │   └── DJI_20260206174112_0754_D.SRT
+        ├── temp/                                   ← safe to delete after review
+        │   ├── defects/
+        │   │   └── Patch/
+        │   │       ├── DJI_..._Patch_crop_000001.jpg
+        │   │       └── DJI_..._Patch_crop_000002.jpg
+        │   └── frames/
+        │       ├── DJI_..._Patch_frame_000001.jpg
+        │       └── DJI_..._Patch_frame_000002.jpg
+        └── output/                                 ← keep forever
+            ├── annotated_video/
+            │   └── DJI_20260206174112_0754_D_annotated.mp4
+            └── reports/
+                └── DJI_20260206174112_0754_D_detections.json
 ```
 
-### S3 Output Structure
+---
+
+## Database Schema
+
+### `processing_jobs` table
+| Column | Description |
+|--------|-------------|
+| id | Job UUID |
+| status | pending / downloading / processing / uploading / completed / failed |
+| input_video_s3_url | S3 URL of input video |
+| input_srt_s3_url | S3 URL of input SRT |
+| input_s3_prefix | S3 input/ folder prefix |
+| temp_s3_prefix | S3 temp/ folder prefix (crops + frames) |
+| output_s3_prefix | S3 output/ folder prefix (video + report) |
+| annotated_video_s3 | Full S3 URL of annotated video |
+| report_json_s3 | Full S3 URL of JSON report |
+| video_basename | Video filename without extension |
+| starting_chainage_m | Starting chainage in meters |
+| ending_chainage_m | Ending chainage in meters |
+| total_detections | Total defects found |
+| created_at / started_at / completed_at | Timestamps |
+| error_message | Error details if failed |
+
+### `detections` table
+| Column | Description |
+|--------|-------------|
+| id | Auto increment |
+| job_id | Foreign key to processing_jobs |
+| defect_type | e.g. Patch, Cracking, Pothole |
+| chainage_avg_m | Location on road in meters |
+| gps_latitude / gps_longitude | GPS coordinates |
+| crop_image_s3_url | S3 URL of cropped defect image (in temp/) |
+| frame_image_s3_url | S3 URL of full frame image (in temp/) |
+| frame_start / frame_end | Frame numbers |
+| polygon | Segmentation polygon (JSON) |
+
+---
+
+## Project File Structure
 
 ```
-s3://{bucket}/road-assessments/{job_id}/{video_basename}/
-├── output/
-│   ├── annotated_video/
-│   │   └── DJI_0001_annotated.mp4
-│   ├── defects/
-│   │   ├── pothole/
-│   │   │   ├── DJI_0001_pothole_crop_000001.jpg
-│   │   │   └── ...
-│   │   └── cracking/
-│   └── frames/
-│       └── DJI_0001_pothole_frame_000001.jpg
-└── reports/
-    └── DJI_0001_detections.json
+prod_db_s3/
+├── main.py                  ← FastAPI app, API endpoints
+├── .env                     ← All configuration (never commit this)
+├── requirements.txt
+├── schema.sql
+├── config/
+│   ├── __init__.py
+│   └── settings.py          ← Pydantic settings loaded from .env
+├── core/
+│   ├── __init__.py
+│   ├── database.py          ← SQLAlchemy models + CRUD functions
+│   ├── job_runner.py        ← Queue system + job orchestration
+│   ├── pipeline.py          ← RF-DETR inference + tracking
+│   ├── s3_manager.py        ← S3 upload/download + folder structure
+│   ├── srt_parser.py        ← DJI SRT GPS parsing
+│   └── tracker.py           ← Segmentation tracker
+├── utils/
+│   ├── __init__.py
+│   ├── file_manager.py      ← Local temp/final folder management
+│   └── logger.py            ← JSON structured logging
+├── temp/                    ← Local working directory (auto cleaned)
+├── final/                   ← Local staging before S3 upload (auto cleaned)
+└── logs/                    ← Log files
 ```
 
 ---
@@ -76,146 +110,171 @@ s3://{bucket}/road-assessments/{job_id}/{video_basename}/
 ## Setup
 
 ### 1. Install dependencies
-
 ```bash
-pip install -r requirements.txt
+pip install fastapi uvicorn pydantic pydantic-settings sqlalchemy pymysql \
+            cryptography boto3 python-dotenv awscli
 ```
 
-### 2. Configure environment
+### 2. Configure .env
+```env
+AWS_ACCESS_KEY_ID=your_key
+AWS_SECRET_ACCESS_KEY=your_secret
+AWS_REGION=ap-south-1
+S3_BUCKET_NAME=novametrics-ai-data-processing
+S3_OUTPUT_PREFIX=Chattisgarh_Road_defect_detection
 
-```bash
-cp .env.example .env
-# Edit .env with your AWS credentials, MySQL details, and model paths
+DB_HOST=localhost
+DB_PORT=3306
+DB_NAME=road_assessment
+DB_USER=roaduser
+DB_PASSWORD=your_password
+
+MODEL_CHECKPOINT_PATH=/path/to/checkpoint_best_total.pth
+COCO_JSON_PATH=/path/to/_annotations.coco.json
+IMAGE_SIZE=432
+NUM_QUERIES=200
+
+PROCESS_EVERY_N_FRAMES=1
+BATCH_SIZE=1
+OUT_WIDTH=1280
+OUT_HEIGHT=720
+MASK_OPACITY=0.20
+GLOBAL_THRESHOLD=0.30
+NMS_THRESHOLD=0.50
+IOU_THRESHOLD=0.30
+MAX_DISTANCE=50
+MAX_LOST=30
+
+TEMP_DIR=/path/to/prod_db_s3/temp
+FINAL_DIR=/path/to/prod_db_s3/final
+LOG_DIR=/path/to/prod_db_s3/logs
+LOG_LEVEL=INFO
+
+API_HOST=0.0.0.0
+API_PORT=8001
+API_WORKERS=1
 ```
 
-### 3. Set up MySQL
-
+### 3. Setup MySQL
 ```bash
-mysql -u root -p < schema.sql
-# or let the API auto-create tables on first startup
+sudo mysql
+```
+```sql
+CREATE DATABASE road_assessment;
+CREATE USER 'roaduser'@'localhost' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON road_assessment.* TO 'roaduser'@'localhost';
+FLUSH PRIVILEGES;
+EXIT;
 ```
 
-### 4. Start the API
-
+### 4. Start the server
 ```bash
-python main.py
-# or with uvicorn directly:
-uvicorn main:app --host 0.0.0.0 --port 8000
+cd /path/to/prod_db_s3
+python3 main.py
 ```
 
 ---
 
-## API Reference
+## API Usage
 
-### Submit a Job
-
-```http
-POST /jobs
-Content-Type: application/json
-
-{
-  "video_s3_url": "s3://my-bucket/input/DJI_0001.MP4",
-  "srt_s3_url":   "s3://my-bucket/input/DJI_0001.SRT",
-  "starting_chainage_m": 0.0
-}
+### Submit a job
+```bash
+curl -X POST "http://localhost:8001/jobs" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "video_s3_url": "s3://novametrics-ai-data-processing/Chattisgarh_Road_defect_detection/input/2026-02-06_17-41-12/DJI_20260206174112_0754_D.MP4",
+    "srt_s3_url":   "s3://novametrics-ai-data-processing/Chattisgarh_Road_defect_detection/input/2026-02-06_17-41-12/DJI_20260206174112_0754_D.SRT",
+    "starting_chainage_m": 0.0
+  }'
 ```
 
-**Response (202 Accepted)**
+Response:
 ```json
-{
-  "job_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "pending",
-  "message": "Job accepted. Poll GET /jobs/550e... for status."
-}
+{"job_id": "920792ea-...", "status": "pending", "message": "Job accepted..."}
+```
+
+### Check job status
+```bash
+curl http://localhost:8001/jobs/920792ea-...
+```
+
+### List all jobs
+```bash
+curl http://localhost:8001/jobs
+```
+
+### Get detections for a job
+```bash
+curl http://localhost:8001/jobs/920792ea-.../detections
+```
+
+### Health check
+```bash
+curl http://localhost:8001/health
 ```
 
 ---
 
-### Poll Job Status
+## Upload Input Video to S3
 
-```http
-GET /jobs/{job_id}
-```
+```bash
+# Configure AWS CLI
+aws configure
 
-**Response**
-```json
-{
-  "job_id": "550e8400-...",
-  "status": "completed",
-  "video_basename": "DJI_0001",
-  "total_detections": 47,
-  "starting_chainage_m": 0.0,
-  "ending_chainage_m": 1523.4,
-  "annotated_video_s3": "s3://bucket/road-assessments/.../DJI_0001_annotated.mp4",
-  "report_json_s3":     "s3://bucket/road-assessments/.../DJI_0001_detections.json",
-  "s3_prefix":          "road-assessments/550e.../DJI_0001",
-  "created_at":  "2026-02-19T10:00:00",
-  "started_at":  "2026-02-19T10:00:02",
-  "completed_at":"2026-02-19T10:08:45"
-}
-```
+# Upload with correct folder structure
+aws s3 cp "/path/to/DJI_20260206174112_0754_D.MP4" \
+  "s3://novametrics-ai-data-processing/Chattisgarh_Road_defect_detection/input/2026-02-06_17-41-12/DJI_20260206174112_0754_D.MP4"
 
-Status values: `pending → downloading → processing → uploading → completed | failed`
-
----
-
-### Get All Detections
-
-```http
-GET /jobs/{job_id}/detections
-```
-
-Returns every defect with chainage, GPS, and S3 image URLs.
-
----
-
-### Generate Presigned URL
-
-```http
-POST /presign?s3_url=s3://bucket/...&expiry_seconds=3600
-```
-
-Converts an internal `s3://` URL into a shareable HTTPS link.
-
----
-
-### List All Jobs
-
-```http
-GET /jobs?limit=20&offset=0
+aws s3 cp "/path/to/DJI_20260206174112_0754_D.SRT" \
+  "s3://novametrics-ai-data-processing/Chattisgarh_Road_defect_detection/input/2026-02-06_17-41-12/DJI_20260206174112_0754_D.SRT"
 ```
 
 ---
 
-## Database Tables
+## Queue System
 
-| Table | Purpose |
-|-------|---------|
-| `processing_jobs` | One row per submitted job; tracks status, S3 URLs, chainage |
-| `detections` | One row per defect; stores GPS, chainage, defect type, S3 image URLs |
+Jobs are processed **one at a time**. Submit multiple jobs freely — they will queue automatically:
+
+```
+📥 JOB QUEUED! — Video 1 — Position 1 — Processing now
+📥 JOB QUEUED! — Video 2 — Position 2 — Waiting, 1 job ahead
+
+▶  STARTING JOB: abc-123
+✅ JOB COMPLETED! — 3 detections — 928.6m
+
+▶  STARTING JOB: def-456
+✅ JOB COMPLETED! — 7 detections — 1850.2m
+
+All jobs done!
+```
+
+---
+
+## Delete Temp Files from S3
+
+After reviewing crop/frame images, delete temp to save storage:
+
+```bash
+aws s3 rm "s3://novametrics-ai-data-processing/Chattisgarh_Road_defect_detection/2026-02-06_DJI_20260206174112_0754_D/temp/" --recursive
+```
+
+---
+
+## Ignored Classes (not detected/saved)
+
+These classes are skipped completely:
+`white_mark`, `water_mark`, `doubt`, `bump`, `guard_post`, `overhead_sign_board`, `sign_board`, `kerb_damage`
 
 ---
 
 ## Multi-Video Chainage Continuity
 
-To process multiple videos as a continuous road segment, pass the
-`ending_chainage_m` from the previous job as `starting_chainage_m` in the next:
+For continuous road surveys across multiple videos, pass the ending chainage of the previous job as starting chainage of the next:
 
-```python
-# Job 1 — starts at 0 km
-r1 = requests.post("/jobs", json={
-    "video_s3_url": "s3://bucket/video1.MP4",
-    "srt_s3_url":   "s3://bucket/video1.SRT",
-    "starting_chainage_m": 0.0,
-})
+```bash
+# Video 1 — starts at 0
+curl -X POST "http://localhost:8001/jobs" -d '{"starting_chainage_m": 0.0, ...}'
 
-# Poll until completed, then:
-status1 = requests.get(f"/jobs/{r1.json()['job_id']}").json()
-
-# Job 2 — continues from where Job 1 ended
-r2 = requests.post("/jobs", json={
-    "video_s3_url": "s3://bucket/video2.MP4",
-    "srt_s3_url":   "s3://bucket/video2.SRT",
-    "starting_chainage_m": status1["ending_chainage_m"],
-})
+# Video 2 — starts where Video 1 ended (928.6m)
+curl -X POST "http://localhost:8001/jobs" -d '{"starting_chainage_m": 928.6, ...}'
 ```
