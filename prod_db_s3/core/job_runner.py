@@ -9,9 +9,10 @@ from config.settings import get_settings
 from core import database as db
 from core.pipeline import VideoPipeline, load_class_names, IGNORED_CLASSES
 from core.s3_manager import (
+    build_s3_input_prefix,
+    build_s3_temp_prefix,
     build_s3_output_prefix,
     download_from_s3,
-    extract_date_from_basename,
     parse_s3_url,
     upload_directory_to_s3,
 )
@@ -21,11 +22,8 @@ from utils.logger import get_logger
 logger   = get_logger(__name__)
 settings = get_settings()
 
-# Model singleton
-_model       = None
-_class_names = None
-
-# Queue system
+_model        = None
+_class_names  = None
 _job_queue    = []
 _queue_lock   = threading.Lock()
 _queue_thread = None
@@ -79,19 +77,24 @@ def _queue_worker():
             print(f"✅ JOB COMPLETED!")
             print(f"   Job ID      : {job_id}")
             print(f"   Video       : {result.get('video_basename')}")
-            print(f"   Date        : {result.get('date_str')}")
             print(f"   Detections  : {result.get('total_detections')}")
             print(f"   Chainage    : {result.get('ending_chainage_m', 0):.1f} m")
-            print(f"   Video S3    : {result.get('annotated_video_s3')}")
-            print(f"   Report S3   : {result.get('report_json_s3')}")
+            print(f"")
+            print(f"   📁 S3 STRUCTURE:")
+            print(f"   ├── input/  : {result.get('input_s3_prefix')}")
+            print(f"   ├── temp/   : {result.get('temp_s3_prefix')}  <- delete when done")
+            print(f"   └── output/ : {result.get('output_s3_prefix')}  <- keep forever")
+            print(f"")
+            print(f"   📹 Annotated Video : {result.get('annotated_video_s3')}")
+            print(f"   📊 Report JSON     : {result.get('report_json_s3')}")
             print(f"   Queue left  : {len(_job_queue)}")
             if len(_job_queue) == 0:
-                print(f"   🎉 All jobs done!")
+                print(f"   All jobs done!")
             print(f"{'='*60}\n")
 
         except Exception as exc:
             print(f"\n{'='*60}")
-            print(f"❌ JOB FAILED!")
+            print(f"JOB FAILED!")
             print(f"   Job ID     : {job_id}")
             print(f"   Error      : {exc}")
             print(f"   Queue left : {len(_job_queue)}")
@@ -127,13 +130,12 @@ def submit_job(
     _ensure_queue_running()
 
     print(f"\n{'='*60}")
-    print(f"📥 JOB QUEUED!")
+    print(f"JOB QUEUED!")
     print(f"   Job ID   : {job_id}")
     print(f"   Video    : {video_s3_url.split('/')[-1]}")
     print(f"   Position : {position} in queue")
-    print(f"   Status   : {'Processing now' if position == 1 else 'Waiting — ' + str(position-1) + ' job(s) ahead'}")
+    print(f"   Status   : {'Processing now' if position == 1 else 'Waiting - ' + str(position-1) + ' job(s) ahead'}")
     print(f"{'='*60}\n")
-
     return job_id
 
 
@@ -158,10 +160,23 @@ def _run_single_job(job_id: str) -> dict:
         _, srt_key     = parse_s3_url(srt_s3_url)
         srt_filename   = Path(srt_key).name
 
-        # Extract date from video filename e.g. DJI_20260206... → 2026-02-06
-        date_str = extract_date_from_basename(video_basename)
+        input_s3_prefix  = build_s3_input_prefix(video_basename)
+        temp_s3_prefix   = build_s3_temp_prefix(video_basename)
+        output_s3_prefix = build_s3_output_prefix(video_basename)
 
-        db.update_job_status(job_id, "downloading", video_basename=video_basename)
+        print(f"\n   S3 folders for this job:")
+        print(f"   input/  : {input_s3_prefix}")
+        print(f"   temp/   : {temp_s3_prefix}")
+        print(f"   output/ : {output_s3_prefix}\n")
+
+        db.update_job_status(
+            job_id, "downloading",
+            video_basename=video_basename,
+            input_s3_prefix=input_s3_prefix,
+            temp_s3_prefix=temp_s3_prefix,
+            output_s3_prefix=output_s3_prefix,
+        )
+
         file_manager = FileManager(
             job_id=job_id,
             class_names=class_names,
@@ -172,6 +187,7 @@ def _run_single_job(job_id: str) -> dict:
         local_srt   = download_from_s3(srt_s3_url,   file_manager.temp_srt_path(srt_filename))
 
         db.update_job_status(job_id, "processing", started_at=datetime.utcnow())
+
         pipeline = VideoPipeline(model=model, class_names=class_names)
         all_detections, ending_chainage = pipeline.run(
             video_path=local_video,
@@ -192,9 +208,13 @@ def _run_single_job(job_id: str) -> dict:
             json.dump({
                 "job_id":              job_id,
                 "video_name":          video_filename,
-                "date":                date_str,
                 "processing_date":     datetime.utcnow().isoformat(),
                 "model":               "RFDETRSegPreview",
+                "s3_structure": {
+                    "input":  input_s3_prefix,
+                    "temp":   temp_s3_prefix,
+                    "output": output_s3_prefix,
+                },
                 "input_video_s3":      video_s3_url,
                 "input_srt_s3":        srt_s3_url,
                 "starting_chainage_m": starting_chainage_m,
@@ -206,49 +226,55 @@ def _run_single_job(job_id: str) -> dict:
 
         db.update_job_status(job_id, "uploading")
 
-        # Clean traceable S3 prefix: prefix/date/video_basename/output
-        s3_prefix = build_s3_output_prefix(video_basename, date_str)
-        url_map   = upload_directory_to_s3(file_manager.final_root, s3_prefix, max_workers=8)
+        temp_local   = file_manager.final_temp_dir(video_basename)
+        output_local = file_manager.final_output_dir(video_basename)
 
-        # Map local paths to S3 URLs for each detection
+        temp_url_map   = upload_directory_to_s3(temp_local,   temp_s3_prefix,   max_workers=8)
+        output_url_map = upload_directory_to_s3(output_local, output_s3_prefix, max_workers=8)
+
         for det in all_detections:
-            crop_local  = str(file_manager.final_crop_path(
+            crop_rel  = file_manager.final_crop_path(
                 det["defect_type"], det["id"], video_basename
-            ).relative_to(file_manager.final_root))
-            frame_local = str(file_manager.final_frame_path(
+            ).relative_to(temp_local).as_posix()
+            frame_rel = file_manager.final_frame_path(
                 det["defect_type"], det["id"], video_basename
-            ).relative_to(file_manager.final_root))
+            ).relative_to(temp_local).as_posix()
             det["s3_urls"] = {
-                "crop":  url_map.get(crop_local,  ""),
-                "frame": url_map.get(frame_local, ""),
+                "crop":  temp_url_map.get(crop_rel,  ""),
+                "frame": temp_url_map.get(frame_rel, ""),
             }
 
-        annotated_video_s3 = url_map.get(str(
+        annotated_video_s3 = output_url_map.get(
             file_manager.final_annotated_video_path(video_basename)
-            .relative_to(file_manager.final_root)
-        ), "")
-        report_json_s3 = url_map.get(str(
-            report_path.relative_to(file_manager.final_root)
-        ), "")
+            .relative_to(output_local).as_posix(), ""
+        )
+        report_json_s3 = output_url_map.get(
+            report_path.relative_to(output_local).as_posix(), ""
+        )
 
         db.save_detections_bulk(job_id, all_detections)
         db.update_job_status(
             job_id, "completed",
-            output_s3_prefix=s3_prefix,
+            input_s3_prefix=input_s3_prefix,
+            temp_s3_prefix=temp_s3_prefix,
+            output_s3_prefix=output_s3_prefix,
             annotated_video_s3=annotated_video_s3,
             report_json_s3=report_json_s3,
             ending_chainage_m=ending_chainage,
             total_detections=len(all_detections),
         )
+
         file_manager.cleanup_temp()
 
         return {
             "job_id":             job_id,
             "status":             "completed",
             "video_basename":     video_basename,
-            "date_str":           date_str,
             "total_detections":   len(all_detections),
             "ending_chainage_m":  ending_chainage,
+            "input_s3_prefix":    input_s3_prefix,
+            "temp_s3_prefix":     temp_s3_prefix,
+            "output_s3_prefix":   output_s3_prefix,
             "annotated_video_s3": annotated_video_s3,
             "report_json_s3":     report_json_s3,
             "summary":            summary,
