@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Generator, Optional
 
 import sqlalchemy as sa
 from sqlalchemy import (
-    Column, DateTime, Float, ForeignKey, Integer, JSON,
-    String, Text, Enum, create_engine,
+    Column, DateTime, Float, ForeignKey, Integer,
+    String, Text, Enum, JSON, create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
 
@@ -17,7 +16,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_engine = None
+_engine       = None
 _SessionLocal = None
 
 
@@ -52,8 +51,8 @@ def get_session_factory():
 
 @contextmanager
 def get_db_session() -> Generator[Session, None, None]:
-    Session = get_session_factory()
-    session = Session()
+    SessionLocal = get_session_factory()
+    session = SessionLocal()
     try:
         yield session
         session.commit()
@@ -77,23 +76,36 @@ class ProcessingJob(Base):
              "completed", "failed", name="job_status"),
         nullable=False, default="pending", index=True,
     )
+
+    # ── Input ──────────────────────────────────────────────────
     input_video_s3_url  = Column(String(2048), nullable=False)
     input_srt_s3_url    = Column(String(2048), nullable=False)
+    input_s3_prefix     = Column(String(2048), nullable=True)   # S3 input/ folder
+
+    # ── Processing ─────────────────────────────────────────────
     video_basename      = Column(String(255),  nullable=True)
-    output_s3_prefix    = Column(String(2048), nullable=True)
-    annotated_video_s3  = Column(String(2048), nullable=True)
-    report_json_s3      = Column(String(2048), nullable=True)
-    total_frames        = Column(Integer,  nullable=True)
-    processed_frames    = Column(Integer,  nullable=True)
-    video_fps           = Column(Float,    nullable=True)
-    starting_chainage_m = Column(Float,    nullable=True, default=0.0)
-    ending_chainage_m   = Column(Float,    nullable=True)
-    total_detections    = Column(Integer,  nullable=True, default=0)
+    total_frames        = Column(Integer,      nullable=True)
+    processed_frames    = Column(Integer,      nullable=True)
+    video_fps           = Column(Float,        nullable=True)
+    starting_chainage_m = Column(Float,        nullable=True, default=0.0)
+    ending_chainage_m   = Column(Float,        nullable=True)
+    total_detections    = Column(Integer,      nullable=True, default=0)
+
+    # ── S3 Output Prefixes ─────────────────────────────────────
+    temp_s3_prefix      = Column(String(2048), nullable=True)   # S3 temp/ folder  → crops + frames
+    output_s3_prefix    = Column(String(2048), nullable=True)   # S3 output/ folder → video + report
+
+    # ── Final S3 URLs ──────────────────────────────────────────
+    annotated_video_s3  = Column(String(2048), nullable=True)   # output/annotated_video/
+    report_json_s3      = Column(String(2048), nullable=True)   # output/reports/
+
+    # ── Timestamps ─────────────────────────────────────────────
     created_at          = Column(DateTime, nullable=False, default=datetime.utcnow)
     started_at          = Column(DateTime, nullable=True)
     completed_at        = Column(DateTime, nullable=True)
-    error_message       = Column(Text, nullable=True)
-    detections          = relationship(
+    error_message       = Column(Text,     nullable=True)
+
+    detections = relationship(
         "Detection", back_populates="job", cascade="all, delete-orphan"
     )
 
@@ -101,34 +113,39 @@ class ProcessingJob(Base):
 class Detection(Base):
     __tablename__ = "detections"
 
-    id                  = Column(Integer, primary_key=True, autoincrement=True)
-    job_id              = Column(String(36), ForeignKey("processing_jobs.id",
-                          ondelete="CASCADE"), nullable=False, index=True)
-    det_sequence_id     = Column(Integer,  nullable=False)
-    track_id            = Column(Integer,  nullable=True)
+    id                  = Column(Integer,     primary_key=True, autoincrement=True)
+    job_id              = Column(String(36),  ForeignKey("processing_jobs.id", ondelete="CASCADE"),
+                                 nullable=False, index=True)
+    det_sequence_id     = Column(Integer,     nullable=False)
+    track_id            = Column(Integer,     nullable=True)
     defect_type         = Column(String(100), nullable=False, index=True)
-    confidence          = Column(Float,    nullable=True)
+    confidence          = Column(Float,       nullable=True)
     video_name          = Column(String(255), nullable=True)
-    frame_start         = Column(Integer,  nullable=True)
-    frame_end           = Column(Integer,  nullable=True)
-    timestamp_start     = Column(String(50), nullable=True)
-    timestamp_end       = Column(String(50), nullable=True)
-    chainage_start_m    = Column(Float,    nullable=True)
-    chainage_end_m      = Column(Float,    nullable=True)
-    chainage_avg_m      = Column(Float,    nullable=True)
-    gps_latitude        = Column(Float,    nullable=True)
-    gps_longitude       = Column(Float,    nullable=True)
-    crop_image_s3_url   = Column(String(2048), nullable=True)
-    frame_image_s3_url  = Column(String(2048), nullable=True)
-    polygon             = Column(JSON,     nullable=True)
-    created_at          = Column(DateTime, nullable=False, default=datetime.utcnow)
-    job                 = relationship("ProcessingJob", back_populates="detections")
+    frame_start         = Column(Integer,     nullable=True)
+    frame_end           = Column(Integer,     nullable=True)
+    timestamp_start     = Column(String(50),  nullable=True)
+    timestamp_end       = Column(String(50),  nullable=True)
+    chainage_start_m    = Column(Float,       nullable=True)
+    chainage_end_m      = Column(Float,       nullable=True)
+    chainage_avg_m      = Column(Float,       nullable=True, index=True)
+    gps_latitude        = Column(Float,       nullable=True)
+    gps_longitude       = Column(Float,       nullable=True)
+    crop_image_s3_url   = Column(String(2048), nullable=True)   # in S3 temp/
+    frame_image_s3_url  = Column(String(2048), nullable=True)   # in S3 temp/
+    polygon             = Column(JSON,        nullable=True)
+    created_at          = Column(DateTime,    nullable=False, default=datetime.utcnow)
 
+    job = relationship("ProcessingJob", back_populates="detections")
+
+
+# ── Table Management ───────────────────────────────────────────
 
 def create_all_tables() -> None:
     Base.metadata.create_all(bind=get_engine())
     logger.info("Database tables verified / created")
 
+
+# ── CRUD ───────────────────────────────────────────────────────
 
 def create_job(
     job_id: str,
@@ -184,8 +201,8 @@ def save_detections_bulk(job_id: str, detections: list[dict]) -> None:
                 chainage_avg_m=d.get("chainage_avg_m"),
                 gps_latitude=d.get("gps", {}).get("latitude"),
                 gps_longitude=d.get("gps", {}).get("longitude"),
-                crop_image_s3_url=d.get("s3_urls", {}).get("crop"),
-                frame_image_s3_url=d.get("s3_urls", {}).get("frame"),
+                crop_image_s3_url=d.get("s3_urls", {}).get("crop", ""),
+                frame_image_s3_url=d.get("s3_urls", {}).get("frame", ""),
                 polygon=d.get("polygon"),
             )
             rows.append(row)
@@ -201,18 +218,25 @@ def get_job(job_id: str) -> Optional[dict]:
         return {
             "id":                   job.id,
             "status":               job.status,
+            # Input
             "input_video_s3_url":   job.input_video_s3_url,
             "input_srt_s3_url":     job.input_srt_s3_url,
+            "input_s3_prefix":      job.input_s3_prefix,
+            # Processing info
             "video_basename":       job.video_basename,
-            "output_s3_prefix":     job.output_s3_prefix,
-            "annotated_video_s3":   job.annotated_video_s3,
-            "report_json_s3":       job.report_json_s3,
             "total_frames":         job.total_frames,
             "processed_frames":     job.processed_frames,
             "starting_chainage_m":  job.starting_chainage_m,
             "ending_chainage_m":    job.ending_chainage_m,
             "total_detections":     job.total_detections,
-            "created_at":           job.created_at.isoformat() if job.created_at else None,
+            # S3 structure
+            "temp_s3_prefix":       job.temp_s3_prefix,
+            "output_s3_prefix":     job.output_s3_prefix,
+            # Final URLs
+            "annotated_video_s3":   job.annotated_video_s3,
+            "report_json_s3":       job.report_json_s3,
+            # Timestamps
+            "created_at":           job.created_at.isoformat()   if job.created_at   else None,
             "started_at":           job.started_at.isoformat()   if job.started_at   else None,
             "completed_at":         job.completed_at.isoformat() if job.completed_at else None,
             "error_message":        job.error_message,
@@ -234,7 +258,9 @@ def list_jobs(limit: int = 50, offset: int = 0) -> list[dict]:
                 "status":           j.status,
                 "video_basename":   j.video_basename,
                 "total_detections": j.total_detections,
-                "created_at":       j.created_at.isoformat() if j.created_at else None,
+                "temp_s3_prefix":   j.temp_s3_prefix,
+                "output_s3_prefix": j.output_s3_prefix,
+                "created_at":       j.created_at.isoformat()   if j.created_at   else None,
                 "completed_at":     j.completed_at.isoformat() if j.completed_at else None,
             }
             for j in jobs
@@ -263,8 +289,8 @@ def get_detections_for_job(job_id: str) -> list[dict]:
                 "chainage_avg_m":      r.chainage_avg_m,
                 "gps_latitude":        r.gps_latitude,
                 "gps_longitude":       r.gps_longitude,
-                "crop_image_s3_url":   r.crop_image_s3_url,
-                "frame_image_s3_url":  r.frame_image_s3_url,
+                "crop_image_s3_url":   r.crop_image_s3_url,    # in S3 temp/
+                "frame_image_s3_url":  r.frame_image_s3_url,   # in S3 temp/
                 "polygon":             r.polygon,
                 "created_at":          r.created_at.isoformat() if r.created_at else None,
             }
