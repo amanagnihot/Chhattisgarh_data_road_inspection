@@ -40,7 +40,7 @@ This script removes annotations with area less than 1 pixel, ensuring extremely 
 
 ---
 
-## ✂️ Step 3: Slice Dataset into Tiles (800x800)
+## ✂️ Step 3: Slice Dataset into Tiles (800x800 or chnage accordingly)
 
 Convert the dataset into tiles using SAHI:
 
